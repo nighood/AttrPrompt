@@ -22,6 +22,7 @@ except ImportError:
     from tensorboardX import SummaryWriter
 from collections import Counter
 from sklearn.metrics import confusion_matrix, ndcg_score, jaccard_score
+import wandb
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,37 @@ def acc_and_f1(preds, labels, average='macro'):
         "f1": f1
     }
 
+class EarlyStopping:
+    def __init__(self, patience=7, delta=0, trace_func=print):
+        """
+        Args:
+            patience (int): How long to wait after last time validation loss improved.
+                            Default: 7
+            delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+                            Default: 0
+            trace_func (function): trace print function.
+                            Default: print
+        """
+        self.patience = patience
+        self.delta = delta
+        self.trace_func = trace_func
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+    def __call__(self, acc):
+        score = acc
+        if self.best_score is None:
+            self.best_score = score
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            self.trace_func(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.counter = 0
+
 class Trainer(object):
     def __init__(self, args, train_dataset = None, dev_dataset = None, test_dataset = None, unlabeled = None, \
                 num_labels = 10, data_size = 100, n_gpu = 1):
@@ -101,6 +133,14 @@ class Trainer(object):
         self.config_class = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=self.num_labels)
         self.model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, num_labels=self.num_labels)
         self.n_gpu = 1
+
+        # init wandb
+        name = args.output_dir.split('/')[-1].split('.')[0]
+        wandb.init(
+            project = 'llm_generate',
+            name = name,
+            config = args
+            )
 
     def reinit(self):
         self.load_model()
@@ -329,6 +369,7 @@ class Trainer(object):
         criterion = nn.CrossEntropyLoss(reduction = 'mean') if not self.args.multi_label else nn.BCEWithLogitsLoss()
 
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps = int(training_steps * 0.06 / self.args.gradient_accumulation_steps), num_training_steps = training_steps)
+        early_stopping = EarlyStopping(patience=self.args.patience, delta=self.args.early_stop_delta)
 
         # Train!
         logger.info("***** Running training *****")
@@ -345,8 +386,9 @@ class Trainer(object):
 
         train_iterator = trange(int(self.args.num_train_epochs), desc="Epoch")
         set_seed(self.args)
-        best_dev = -np.float('inf')
-        for _ in train_iterator:
+        best_dev = -np.float32('inf')
+        iteration_num = 0
+        for epoch in train_iterator:
             global_step = 0
             tr_loss = 0.0
             epoch_iterator = tqdm(train_dataloader, desc="Iteration")
@@ -385,20 +427,56 @@ class Trainer(object):
                     scheduler.step()  # Update learning rate schedule
                     self.model.zero_grad()
                     global_step += 1
-                    epoch_iterator.set_description("iteration:%d, Loss:%.3f, best dev:%.3f" % (_, tr_loss/global_step, 100*best_dev))
+
+                    # log to wandb, step is iteration_num
+                    iteration_num += 1
+                    wandb.log(
+                        {
+                            "train/batch_train_loss": loss.item(),
+                            "train/mean_train_loss": tr_loss/global_step,
+                            "train/learning_rate": scheduler.get_last_lr()[0],
+                        },
+                        step=iteration_num
+                    )
+                    epoch_iterator.set_description("iteration:%d, Loss:%.3f, best dev:%.3f" % (epoch, tr_loss/global_step, 100*best_dev))
                 if 0 < training_steps < global_step:
                     epoch_iterator.close()
                     break
 
             loss_dev, acc_dev, f1_dev = self.evaluate('dev', global_step)
+            wandb.log(
+                {
+                    "dev/dev_loss": loss_dev,
+                    "dev/dev_acc": acc_dev,
+                    "dev/dev_f1": f1_dev,
+                },
+                step=iteration_num
+            )
             
             loss_test, acc_test, f1_test = 0 ,0, 0
             loss_test, acc_test, f1_test = self.evaluate('test', global_step)
+            wandb.log(
+                {
+                    "test/test_loss": loss_test,
+                    "test/test_acc": acc_test,
+                    "test/test_f1": f1_test,
+                },
+                step=iteration_num
+            )
+            
+            # if val acc is improved, save the best model
             if acc_dev > best_dev:
                 logger.info("Best model updated!")
                 self.best_model = copy.deepcopy(self.model.state_dict())
                 best_dev = acc_dev
-            print(f'Dev: Loss: {loss_dev}, Acc: {acc_dev}, F1: {f1_dev}', f'Test: Loss: {loss_test}, Acc: {acc_test}, F1: {f1_test}')
+            print(f'\nDev: Loss: {loss_dev}, Acc: {acc_dev}, F1: {f1_dev}', f'\nTest: Loss: {loss_test}, Acc: {acc_test}, F1: {f1_test}')
+            
+            # early stopping check
+            early_stopping(acc_dev)
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
+
         result_dict = {'seed': self.args.train_seed}
         loss_test, acc_test, acc_f1, preds_probs, out_label_ids = self.evaluate('test', global_step, return_preds = True)
         result_dict['acc'] = acc_f1
@@ -409,4 +487,8 @@ class Trainer(object):
         self.save_prediction_test(preds_probs, out_label_ids)
         self.save_model(stage = n_sample)
         return global_step, tr_loss / global_step
+    
+    def __del__(self):
+        wandb.finish()
+        print("Finish logging!")
   

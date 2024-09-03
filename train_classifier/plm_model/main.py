@@ -95,6 +95,9 @@ if __name__ == '__main__':
 
     parser.add_argument('--multi_label', type = int, default = 0, help = 'whether train with multi label or not')
 
+    parser.add_argument('--patience', type = int, default = 5, help = 'early stopping patience')
+    parser.add_argument('--early_stop_delta', type = float, default = 0.0, help = 'early stopping delta')
+    parser.add_argument('--early_stop', type = bool, default = True, help = 'whether to use early stopping or not')
     # semi_method
     args = parser.parse_args()
     if 'deberta-base' in args.model_type:
